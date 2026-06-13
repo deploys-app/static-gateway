@@ -1,0 +1,21 @@
+# Binaries
+/static-gateway
+/bin/
+*.exe
+*.test
+*.out
+
+# Coverage
+coverage.out
+coverage.html
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Local credentials (never commit GCS keys; in cluster we use Workload Identity)
+*.json.key
+service-account*.json
+.env
+.env.*
