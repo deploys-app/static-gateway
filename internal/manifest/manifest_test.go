@@ -54,6 +54,56 @@ func TestLoadDefaults(t *testing.T) {
 	}
 }
 
+func TestLoadCanonicalizesLeadingSlashKeys(t *testing.T) {
+	// A manifest published with leading-slash keys (the historical
+	// build-deploy-action defect) must be re-keyed to slash-less logical paths so
+	// resolution — which normalizes requests to slash-less keys — can find them.
+	data := []byte(`{
+		"environment": "production",
+		"files": {
+			"/index.html": { "blob": "h1", "ct": "text/html; charset=utf-8", "cache": "html" },
+			"/getting-started/index.html": { "blob": "h2", "ct": "text/html; charset=utf-8", "cache": "html" },
+			"/style/main.abc.css": { "blob": "h3", "ct": "text/css; charset=utf-8", "cache": "immutable" }
+		}
+	}`)
+	m, err := Load(data)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	for _, want := range []string{"index.html", "getting-started/index.html", "style/main.abc.css"} {
+		if _, ok := m.Lookup(want); !ok {
+			t.Errorf("Lookup(%q) not found after canonicalization", want)
+		}
+	}
+	// The slash-prefixed spellings must be gone (canonicalized away).
+	if _, ok := m.Lookup("/index.html"); ok {
+		t.Errorf("Lookup(/index.html) should be false after canonicalization")
+	}
+}
+
+func TestLoadCanonicalPrefersSlashlessOnCollision(t *testing.T) {
+	// If both spellings of a path are present, the already-canonical entry wins so
+	// a stray slash-prefixed key cannot clobber a correct one.
+	data := []byte(`{
+		"environment": "production",
+		"files": {
+			"index.html": { "blob": "good", "ct": "text/html", "cache": "html" },
+			"/index.html": { "blob": "bad", "ct": "text/html", "cache": "html" }
+		}
+	}`)
+	m, err := Load(data)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	f, ok := m.Lookup("index.html")
+	if !ok {
+		t.Fatalf("Lookup(index.html) not found")
+	}
+	if f.Blob != "good" {
+		t.Errorf("collision: index.html blob = %q, want canonical entry %q", f.Blob, "good")
+	}
+}
+
 func TestLoadErrors(t *testing.T) {
 	tests := []struct {
 		name string
