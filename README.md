@@ -83,6 +83,14 @@ the requested release already references.
 |---|---|---|---|
 | `SITE_BUCKET` | yes | — | GCS bucket holding the `sites/...` layout |
 | `PORT` | no | `8080` | listen port |
+| `METRICS_PORT` | no | `9090` | Prometheus scrape port (`/metrics`) |
+| `MANIFEST_CACHE_BYTES` | no | `268435456` (256 MiB) | approximate-bytes budget for the parsed-manifest cache; `0` = entry-count bound only |
+| `BLOB_CACHE_BYTES` | no | `134217728` (128 MiB) | in-process cache budget for small immutable blobs (≤1 MiB each) served from memory instead of a GCS read; `0` disables |
+
+The two caches stack in memory — `BLOB_CACHE_BYTES` fills with real file bytes, so
+size the sum against the container memory limit before raising it. Larger blobs
+stream straight from GCS and are never cached (they are immutable and edge-cached
+for a year, so the origin rarely re-reads them).
 
 Credentials come from **Application Default Credentials** — in cluster this is
 Workload Identity bound to a read-only GSA scoped to the static bucket (SPEC §6.5).

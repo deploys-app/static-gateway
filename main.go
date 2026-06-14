@@ -27,6 +27,16 @@ import (
 // manifests cannot OOM the replica. Tune via MANIFEST_CACHE_BYTES.
 const defaultManifestCacheBytes = 256 << 20 // 256 MiB
 
+// defaultBlobCacheBytes bounds the in-process blob cache, which serves small
+// immutable blobs (HTML/CSS/JS/small images) from memory instead of paying a GCS
+// round-trip per request. Tune via BLOB_CACHE_BYTES; 0 disables it.
+//
+// Kept conservative because this cache fills with real file bytes (unlike the
+// manifest cache, whose tiny structs rarely approach their cap) and stacks on top
+// of MANIFEST_CACHE_BYTES — size the sum against the container memory limit before
+// raising it.
+const defaultBlobCacheBytes = 128 << 20 // 128 MiB
+
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	slog.SetDefault(logger)
@@ -48,6 +58,12 @@ func main() {
 		os.Exit(1)
 	}
 	defer func() { _ = closeStore() }()
+
+	// Cache small immutable blobs in-process so hot objects (notably HTML, which
+	// the edge revalidates on every request) skip the GCS round-trip that
+	// dominates origin latency. Content-addressed keys make cached entries valid
+	// forever; manifest reads pass through (the server caches those parsed).
+	store = blobstore.NewCachingStore(store, getenvInt64("BLOB_CACHE_BYTES", defaultBlobCacheBytes), blobstore.DefaultMaxCacheableBlobBytes)
 
 	h, err := server.New(server.Config{
 		Store:              store,
