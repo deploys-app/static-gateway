@@ -10,6 +10,8 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strconv"
+	"time"
 
 	"github.com/moonrhythm/parapet"
 	"github.com/moonrhythm/parapet/pkg/healthz"
@@ -19,6 +21,11 @@ import (
 	"github.com/deploys-app/static-gateway/internal/blobstore"
 	"github.com/deploys-app/static-gateway/internal/server"
 )
+
+// defaultManifestCacheBytes bounds the parsed-manifest cache by approximate
+// retained memory in addition to entry count, so a burst of many large preview
+// manifests cannot OOM the replica. Tune via MANIFEST_CACHE_BYTES.
+const defaultManifestCacheBytes = 256 << 20 // 256 MiB
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
@@ -43,8 +50,9 @@ func main() {
 	defer func() { _ = closeStore() }()
 
 	h, err := server.New(server.Config{
-		Store:  store,
-		Logger: logger,
+		Store:              store,
+		Logger:             logger,
+		ManifestCacheBytes: getenvInt64("MANIFEST_CACHE_BYTES", defaultManifestCacheBytes),
 	})
 	if err != nil {
 		slog.Error("build server", "error", err)
@@ -68,6 +76,13 @@ func main() {
 	// in-cluster parapet core), matching the dropbox/ipfs-gateway pattern.
 	srv := parapet.NewBackend()
 	srv.Addr = ":" + port
+	// Read-side timeouts guard the origin against slow-client / stuck-connection
+	// resource exhaustion (NewBackend leaves these at zero). No WriteTimeout: it is
+	// an absolute deadline over the whole response and would truncate large or slow
+	// blob streams; the manifest load has its own deadline and the GET/HEAD-only
+	// surface carries no meaningful request body.
+	srv.ReadHeaderTimeout = 10 * time.Second
+	srv.ReadTimeout = 30 * time.Second
 	srv.Use(healthz.New())
 	srv.Use(logger2())
 	srv.Handler = h
@@ -90,4 +105,17 @@ func getenv(key, def string) string {
 		return v
 	}
 	return def
+}
+
+func getenvInt64(key string, def int64) int64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n < 0 {
+		slog.Warn("invalid int64 env, using default", "key", key, "value", v, "default", def)
+		return def
+	}
+	return n
 }

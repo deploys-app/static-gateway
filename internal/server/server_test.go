@@ -1,11 +1,15 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -231,6 +235,101 @@ func TestServeLastModified(t *testing.T) {
 	w := do(h, http.MethodGet, prefix("/"), nil)
 	if lm := w.Header().Get("Last-Modified"); lm != "Sat, 13 Jun 2026 10:00:00 GMT" {
 		t.Errorf("Last-Modified = %q", lm)
+	}
+}
+
+func TestServeContentLength(t *testing.T) {
+	m, blobs := hugoManifest("production")
+	h := fixture(t, m, blobs)
+
+	// A served 200 carries Content-Length equal to the blob's byte length (the
+	// Fake's reader exposes Size() like gocloud's *blob.Reader does).
+	w := do(h, http.MethodGet, prefix("/"), nil)
+	body := blobs["b_index"]
+	if cl := w.Header().Get("Content-Length"); cl != strconv.Itoa(len(body)) {
+		t.Errorf("Content-Length = %q, want %d", cl, len(body))
+	}
+	if w.Body.Len() != len(body) {
+		t.Errorf("body len = %d, want %d", w.Body.Len(), len(body))
+	}
+
+	// A 304 must not carry Content-Length (it has no body).
+	etag := w.Header().Get("ETag")
+	w = do(h, http.MethodGet, prefix("/"), map[string]string{"If-None-Match": etag})
+	if w.Code != http.StatusNotModified {
+		t.Fatalf("code = %d, want 304", w.Code)
+	}
+	if cl := w.Header().Get("Content-Length"); cl != "" {
+		t.Errorf("304 Content-Length = %q, want empty", cl)
+	}
+}
+
+// countingBlockingStore wraps a Fake so a test can block the first manifest read
+// and assert that concurrent first-hits coalesce into a single backend Get.
+type countingBlockingStore struct {
+	*blobstore.Fake
+	manifestGets atomic.Int64
+	entered      chan struct{} // a signal per manifest Get that has begun
+	release      chan struct{} // closed to unblock all in-flight manifest Gets
+}
+
+func (s *countingBlockingStore) Get(ctx context.Context, key string) (io.ReadCloser, error) {
+	if strings.Contains(key, "/releases/") {
+		s.manifestGets.Add(1)
+		s.entered <- struct{}{}
+		<-s.release
+	}
+	return s.Fake.Get(ctx, key)
+}
+
+// TestLoadManifestSingleflight proves that a stampede of concurrent first-hits on
+// one cold release collapses to a single manifest read. Without singleflight, all
+// N goroutines would block inside their own manifest Get and the count would be N.
+func TestLoadManifestSingleflight(t *testing.T) {
+	const n = 24
+	m, blobs := hugoManifest("production")
+	fake := blobstore.NewFake()
+	mb, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	fake.Put(blobstore.ManifestKey(testProject, testName, testRelease), mb, "application/json")
+	for sha, body := range blobs {
+		fake.Put(blobstore.BlobKey(testProject, testName, sha), []byte(body), "")
+	}
+	store := &countingBlockingStore{
+		Fake:    fake,
+		entered: make(chan struct{}, n),
+		release: make(chan struct{}),
+	}
+	h, err := New(Config{Store: store})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	codes := make([]int, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			w := do(h, http.MethodGet, prefix("/"), nil)
+			codes[i] = w.Code
+		}(i)
+	}
+
+	// Wait until at least one manifest Get is in-flight, then release everyone.
+	<-store.entered
+	close(store.release)
+	wg.Wait()
+
+	if got := store.manifestGets.Load(); got != 1 {
+		t.Errorf("manifest Gets = %d, want 1 (singleflight should coalesce)", got)
+	}
+	for i, c := range codes {
+		if c != http.StatusOK {
+			t.Errorf("goroutine %d code = %d, want 200", i, c)
+		}
 	}
 }
 

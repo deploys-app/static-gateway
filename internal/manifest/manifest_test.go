@@ -41,6 +41,41 @@ func TestLoad(t *testing.T) {
 	}
 }
 
+func TestLoadPrecomputes(t *testing.T) {
+	m, err := Load([]byte(`{
+		"createdAt": "2026-06-13T10:00:00Z",
+		"environment": "production",
+		"files": {"index.html": {"blob": "h1", "ct": "text/html; charset=utf-8", "cache": "html"}}
+	}`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := m.LastModified(); got != "Sat, 13 Jun 2026 10:00:00 GMT" {
+		t.Errorf("LastModified = %q", got)
+	}
+	if m.ModTime().IsZero() {
+		t.Errorf("ModTime is zero, want parsed createdAt")
+	}
+	if m.ApproxSize() <= 0 {
+		t.Errorf("ApproxSize = %d, want > 0", m.ApproxSize())
+	}
+}
+
+func TestLoadPrecomputeMissingCreatedAt(t *testing.T) {
+	// No createdAt -> no Last-Modified, zero ModTime (the gateway then omits the
+	// header), but ApproxSize is still computed.
+	m, err := Load([]byte(`{"environment":"production","files":{"index.html":{"blob":"h1","ct":"text/html","cache":"html"}}}`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if m.LastModified() != "" || !m.ModTime().IsZero() {
+		t.Errorf("expected empty Last-Modified and zero ModTime, got %q / %v", m.LastModified(), m.ModTime())
+	}
+	if m.ApproxSize() <= 0 {
+		t.Errorf("ApproxSize = %d, want > 0", m.ApproxSize())
+	}
+}
+
 func TestLoadDefaults(t *testing.T) {
 	m, err := Load([]byte(`{"environment":"pr-7","files":{"index.html":{"blob":"h1","ct":"text/html","cache":"html"}}}`))
 	if err != nil {
