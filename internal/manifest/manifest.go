@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/deploys-app/static-gateway/internal/cacheheader"
 )
@@ -97,7 +98,48 @@ func Load(data []byte) (*Manifest, error) {
 			return nil, fmt.Errorf("manifest: file %q has empty blob", p)
 		}
 	}
+	m.Files = canonicalizeFileKeys(m.Files)
 	return &m, nil
+}
+
+// canonicalizeFileKeys re-keys files to the gateway's canonical logical form: a
+// slash-less path (SPEC §5.3). A correct publisher already emits such keys, but
+// build-deploy-action historically wrote them with a leading slash ("/index.html").
+// Resolution normalizes every request path to a slash-less key (see
+// resolve.normalize), so a slash-prefixed manifest misses on every lookup and 404s
+// the entire site. Stripping the leading slash here heals those already-published,
+// immutable releases without a re-deploy and makes the in-memory index robust to
+// that class of publisher drift. When both the canonical and a slash-prefixed
+// spelling of a path are present, the already-canonical entry wins.
+func canonicalizeFileKeys(files map[string]File) map[string]File {
+	needsFix := false
+	for k := range files {
+		if strings.HasPrefix(k, "/") {
+			needsFix = true
+			break
+		}
+	}
+	if !needsFix {
+		return files
+	}
+	out := make(map[string]File, len(files))
+	// Pass 1: keep already-canonical keys; they take precedence on collision.
+	for k, f := range files {
+		if !strings.HasPrefix(k, "/") {
+			out[k] = f
+		}
+	}
+	// Pass 2: add slash-stripped keys only where the canonical form is absent.
+	for k, f := range files {
+		if !strings.HasPrefix(k, "/") {
+			continue
+		}
+		ck := strings.TrimLeft(k, "/")
+		if _, ok := out[ck]; !ok {
+			out[ck] = f
+		}
+	}
+	return out
 }
 
 // Canonical serializes a manifest deterministically: object keys sorted, files

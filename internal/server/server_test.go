@@ -107,6 +107,50 @@ func TestServeRootIndex(t *testing.T) {
 	}
 }
 
+// TestServeLeadingSlashManifestHeals proves the gateway serves a release whose
+// manifest was published with leading-slash keys (the historical
+// build-deploy-action defect) — every route, not just root — instead of 404ing the
+// whole site. This is the defense-in-depth that heals already-published immutable
+// releases without a re-deploy.
+func TestServeLeadingSlashManifestHeals(t *testing.T) {
+	m := &manifest.Manifest{
+		Release:     testRelease,
+		Environment: "production",
+		NotFound:    "404.html",
+		Files: map[string]manifest.File{
+			"/index.html":                 {Blob: "b_index", ContentType: "text/html; charset=utf-8", Cache: "html"},
+			"/404.html":                   {Blob: "b_404", ContentType: "text/html; charset=utf-8", Cache: "html"},
+			"/getting-started/index.html": {Blob: "b_gs", ContentType: "text/html; charset=utf-8", Cache: "html"},
+			"/style/main.4f3a9b.css":      {Blob: "b_css", ContentType: "text/css; charset=utf-8", Cache: "immutable"},
+		},
+	}
+	blobs := map[string]string{
+		"b_index": "<html>home</html>",
+		"b_404":   "<html>custom not found</html>",
+		"b_gs":    "<html>getting started</html>",
+		"b_css":   "body{color:red}",
+	}
+	h := fixture(t, m, blobs)
+
+	// Root, a clean-URL sub-page, and a fingerprinted asset all resolve to 200.
+	for _, tc := range []struct{ path, body string }{
+		{"/", "<html>home</html>"},
+		{"/getting-started/", "<html>getting started</html>"},
+		{"/style/main.4f3a9b.css", "body{color:red}"},
+	} {
+		w := do(h, http.MethodGet, prefix(tc.path), nil)
+		if w.Code != http.StatusOK || w.Body.String() != tc.body {
+			t.Errorf("%s: code=%d body=%q, want 200 %q", tc.path, w.Code, w.Body.String(), tc.body)
+		}
+	}
+
+	// A genuine miss still serves the (slash-published) custom 404 doc with 404.
+	w := do(h, http.MethodGet, prefix("/nope/"), nil)
+	if w.Code != http.StatusNotFound || w.Body.String() != "<html>custom not found</html>" {
+		t.Errorf("miss: code=%d body=%q, want 404 custom doc", w.Code, w.Body.String())
+	}
+}
+
 func TestServeImmutableVsHTMLCacheHeaders(t *testing.T) {
 	m, blobs := hugoManifest("production")
 	h := fixture(t, m, blobs)
