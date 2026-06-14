@@ -27,4 +27,4 @@ jobs:
         provenance: false
         push: true
         tags: |
-          asia-southeast1-docker.pkg.dev/deploys-app/internal/static-gateway:${{ github.sha }}
+          asia-southeast1-docker.pkg.dev/deploys-app/public/static-gateway:${{ github.sha }}
