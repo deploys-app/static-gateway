@@ -8,8 +8,11 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
 	"github.com/deploys-app/static-gateway/internal/blobstore"
 	"github.com/deploys-app/static-gateway/internal/manifest"
+	"github.com/deploys-app/static-gateway/internal/metrics"
 )
 
 const (
@@ -444,3 +447,28 @@ func drainBody(t *testing.T, w *httptest.ResponseRecorder) string {
 }
 
 var _ = drainBody
+
+func TestRequestsMetricIncrements(t *testing.T) {
+	m, blobs := hugoManifest("production")
+	h := fixture(t, m, blobs)
+
+	c := metrics.Requests.WithLabelValues(testProject, testName)
+
+	// A hit and an in-site 404 both count as requests to the site.
+	before := testutil.ToFloat64(c)
+	do(h, http.MethodGet, prefix("/"), nil)
+	do(h, http.MethodGet, prefix("/no-such-page"), nil)
+	if got := testutil.ToFloat64(c) - before; got != 2 {
+		t.Fatalf("requests delta = %v, want 2", got)
+	}
+
+	// A path without a valid 3-segment site prefix is a 400 and is not counted
+	// against any site.
+	before = testutil.ToFloat64(c)
+	if w := do(h, http.MethodGet, "/probe", nil); w.Code != http.StatusBadRequest {
+		t.Fatalf("code = %d, want 400", w.Code)
+	}
+	if got := testutil.ToFloat64(c) - before; got != 0 {
+		t.Fatalf("bad-request delta = %v, want 0", got)
+	}
+}

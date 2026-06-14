@@ -20,6 +20,7 @@ import (
 	"github.com/deploys-app/static-gateway/internal/blobstore"
 	"github.com/deploys-app/static-gateway/internal/cacheheader"
 	"github.com/deploys-app/static-gateway/internal/manifest"
+	"github.com/deploys-app/static-gateway/internal/metrics"
 	"github.com/deploys-app/static-gateway/internal/resolve"
 )
 
@@ -94,6 +95,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
+
+	// Count every request to a resolved site (the collector sums this per
+	// project+name to attribute request volume to the Static deployment).
+	metrics.Requests.WithLabelValues(s.project, s.name).Inc()
 
 	m, err := h.loadManifest(r.Context(), s)
 	if err != nil {

@@ -8,11 +8,13 @@ package main
 import (
 	"context"
 	"log/slog"
+	"net/http"
 	"os"
 
 	"github.com/moonrhythm/parapet"
 	"github.com/moonrhythm/parapet/pkg/healthz"
 	"github.com/moonrhythm/parapet/pkg/logger"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/deploys-app/static-gateway/internal/blobstore"
 	"github.com/deploys-app/static-gateway/internal/server"
@@ -48,6 +50,19 @@ func main() {
 		slog.Error("build server", "error", err)
 		os.Exit(1)
 	}
+
+	// Prometheus metrics on a separate port so the per-site request counter
+	// (static_gateway_requests_total) can be scraped without colliding with the
+	// site-serving handler, which consumes every path. Scrape this port.
+	go func() {
+		metricsAddr := ":" + getenv("METRICS_PORT", "9090")
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", promhttp.Handler())
+		slog.Info("static-gateway metrics listening", "addr", metricsAddr)
+		if err := http.ListenAndServe(metricsAddr, mux); err != nil {
+			slog.Error("metrics listen and serve", "error", err)
+		}
+	}()
 
 	// parapet.NewBackend(): H2C-enabled, trusts X-Forwarded-* (it sits behind the
 	// in-cluster parapet core), matching the dropbox/ipfs-gateway pattern.
