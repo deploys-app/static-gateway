@@ -71,13 +71,16 @@ func (c *CachingStore) Get(ctx context.Context, key string) (io.ReadCloser, erro
 	if n < 0 || n > c.maxBlobBytes {
 		return rc, nil
 	}
-	data, err := io.ReadAll(rc)
-	closeErr := rc.Close()
+	// The size is known, so read exactly n bytes into a right-sized buffer: exact
+	// cache accounting (no io.ReadAll capacity slack inflating memory past the
+	// budget) and one allocation. A short read means the body disagreed with the
+	// reported size — surface that rather than caching a truncated blob. A Close
+	// error after a complete read is benign (the streaming path ignores it too).
+	data := make([]byte, n)
+	_, err = io.ReadFull(rc, data)
+	_ = rc.Close()
 	if err != nil {
 		return nil, err
-	}
-	if closeErr != nil {
-		return nil, closeErr
 	}
 	c.cache.add(key, data)
 	return newBytesReadCloser(data), nil
