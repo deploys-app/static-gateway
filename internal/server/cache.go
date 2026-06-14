@@ -13,27 +13,40 @@ import (
 // invalidation — a new release is a new key (SPEC §4.3). The cache only bounds
 // memory across the (potentially many preview) releases a gateway has served.
 //
+// It is bounded by BOTH an entry count and an approximate-bytes budget: entry
+// count alone cannot prevent an OOM when resident releases have very different
+// manifest sizes (a few thousand-file sites cost far more than the default 1024
+// small ones). Eviction is least-recently-used; a single manifest larger than the
+// whole byte budget is never self-evicted, so it can still serve.
+//
 // It is safe for concurrent use.
 type manifestCache struct {
-	mu  sync.Mutex
-	cap int
-	ll  *list.List               // front = most-recently-used
-	idx map[string]*list.Element // key -> element
+	mu       sync.Mutex
+	cap      int
+	bytesCap int64                    // <=0 means no byte bound (entry count only)
+	bytes    int64                    // sum of cached entries' approximate sizes
+	ll       *list.List               // front = most-recently-used
+	idx      map[string]*list.Element // key -> element
 }
 
 type cacheEntry struct {
-	key string
-	m   *manifest.Manifest
+	key  string
+	m    *manifest.Manifest
+	size int64 // m.ApproxSize() snapshotted at insert, for byte accounting
 }
 
-func newManifestCache(capacity int) *manifestCache {
+func newManifestCache(capacity int, bytesCap int64) *manifestCache {
 	if capacity < 1 {
 		capacity = 1
 	}
+	if bytesCap < 0 {
+		bytesCap = 0
+	}
 	return &manifestCache{
-		cap: capacity,
-		ll:  list.New(),
-		idx: make(map[string]*list.Element, capacity),
+		cap:      capacity,
+		bytesCap: bytesCap,
+		ll:       list.New(),
+		idx:      make(map[string]*list.Element, capacity),
 	}
 }
 
@@ -48,19 +61,32 @@ func (c *manifestCache) get(key string) (*manifest.Manifest, bool) {
 	return nil, false
 }
 
-// add inserts (or refreshes) key->m, evicting the least-recently-used entry when
-// over capacity.
+// add inserts (or refreshes) key->m, evicting least-recently-used entries until
+// the cache is within both the entry-count and byte budgets.
 func (c *manifestCache) add(key string, m *manifest.Manifest) {
+	size := int64(m.ApproxSize())
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if el, ok := c.idx[key]; ok {
 		c.ll.MoveToFront(el)
-		el.Value.(*cacheEntry).m = m
+		e := el.Value.(*cacheEntry)
+		c.bytes += size - e.size
+		e.size = size
+		e.m = m
+		c.evictToBound()
 		return
 	}
-	el := c.ll.PushFront(&cacheEntry{key: key, m: m})
+	el := c.ll.PushFront(&cacheEntry{key: key, m: m, size: size})
 	c.idx[key] = el
-	if c.ll.Len() > c.cap {
+	c.bytes += size
+	c.evictToBound()
+}
+
+// evictToBound drops least-recently-used entries until the cache is within both
+// budgets, but never evicts the last remaining entry — so a single manifest
+// larger than the byte budget still serves rather than thrashing.
+func (c *manifestCache) evictToBound() {
+	for c.ll.Len() > 1 && (c.ll.Len() > c.cap || (c.bytesCap > 0 && c.bytes > c.bytesCap)) {
 		c.evict()
 	}
 }
@@ -71,7 +97,9 @@ func (c *manifestCache) evict() {
 		return
 	}
 	c.ll.Remove(el)
-	delete(c.idx, el.Value.(*cacheEntry).key)
+	e := el.Value.(*cacheEntry)
+	delete(c.idx, e.key)
+	c.bytes -= e.size
 }
 
 // len reports the number of cached entries (for tests).

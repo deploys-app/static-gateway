@@ -18,8 +18,25 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/deploys-app/static-gateway/internal/cacheheader"
+)
+
+// httpDateFormat is the IMF-fixdate layout (RFC 9110 §5.6.7), byte-for-byte
+// identical to net/http.TimeFormat. It is duplicated here so this data/loader
+// package precomputes a Last-Modified value without taking a net/http dependency.
+const httpDateFormat = "Mon, 02 Jan 2006 15:04:05 GMT"
+
+const (
+	// fileEntryBytes approximates the retained memory of one Files map entry
+	// beyond the string contents counted explicitly: the map bucket slot plus the
+	// three string headers inside File. It deliberately overestimates so a
+	// byte-bounded cache stays conservatively under its budget (SPEC §4.7).
+	fileEntryBytes = 96
+	// manifestBaseBytes approximates the fixed per-Manifest overhead (the struct
+	// header, the small scalar/string fields, and the empty map).
+	manifestBaseBytes = 512
 )
 
 // DefaultNotFound is the manifest's notFound document name when the field is
@@ -58,6 +75,13 @@ type Manifest struct {
 	NotFound string `json:"notFound,omitempty"`
 	// Files maps logical path -> backing blob entry.
 	Files map[string]File `json:"files"`
+
+	// Precomputed-at-load, per-request-invariant values (set by Load.precompute).
+	// They trade a little memory to keep the hot serving path free of work that is
+	// identical for every request against this immutable release.
+	modTime      time.Time // CreatedAt parsed once; the conditional-request validator
+	lastModified string    // CreatedAt as an HTTP-date once; the Last-Modified header
+	approxBytes  int       // estimated retained size; bounds the manifest cache by memory
 }
 
 // IsProduction reports whether this release is the production environment.
@@ -81,6 +105,34 @@ func (m *Manifest) Lookup(p string) (File, bool) {
 	return f, ok
 }
 
+// ModTime returns the release's creation time parsed once at load (zero when
+// CreatedAt is absent or unparseable). It is the validator for If-Modified-Since.
+func (m *Manifest) ModTime() time.Time { return m.modTime }
+
+// LastModified returns the release creation time as an HTTP-date, precomputed at
+// load, or "" when CreatedAt is absent or unparseable.
+func (m *Manifest) LastModified() string { return m.lastModified }
+
+// ApproxSize returns an estimate of the manifest's retained memory, used to bound
+// the gateway's manifest cache by bytes in addition to entry count.
+func (m *Manifest) ApproxSize() int { return m.approxBytes }
+
+// precompute derives the per-request-invariant values the gateway reads on the
+// hot path so they are computed once per release instead of once per request.
+func (m *Manifest) precompute() {
+	if m.CreatedAt != "" {
+		if t, err := time.Parse(time.RFC3339, m.CreatedAt); err == nil {
+			m.modTime = t
+			m.lastModified = t.UTC().Format(httpDateFormat)
+		}
+	}
+	size := manifestBaseBytes
+	for p, f := range m.Files {
+		size += len(p) + len(f.Blob) + len(f.ContentType) + len(f.Cache) + fileEntryBytes
+	}
+	m.approxBytes = size
+}
+
 // Load parses a manifest from its JSON bytes and validates the minimum shape the
 // gateway needs to serve from it.
 func Load(data []byte) (*Manifest, error) {
@@ -99,6 +151,7 @@ func Load(data []byte) (*Manifest, error) {
 		}
 	}
 	m.Files = canonicalizeFileKeys(m.Files)
+	m.precompute()
 	return &m, nil
 }
 

@@ -14,8 +14,12 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 
 	"github.com/deploys-app/static-gateway/internal/blobstore"
 	"github.com/deploys-app/static-gateway/internal/cacheheader"
@@ -26,6 +30,32 @@ import (
 
 // DefaultManifestCacheCap is the default LRU capacity for parsed manifests.
 const DefaultManifestCacheCap = 1024
+
+// manifestLoadTimeout bounds a single manifest read+parse. It is the only
+// deadline on that work once a load is detached from its triggering request (so
+// one disconnecting caller cannot fail the others coalesced behind it), and the
+// backend sets no server write deadline.
+const manifestLoadTimeout = 10 * time.Second
+
+// copyBufSize is the per-stream buffer used to copy a blob to the response. It is
+// larger than net/http's default 32 KiB to cut syscalls on bigger assets while
+// staying small enough to pool cheaply.
+const copyBufSize = 64 << 10
+
+// copyBufPool recycles blob-streaming buffers. Pooling pointers avoids an
+// allocation per Get, and using our own buffer (via readerOnly, below) sidesteps
+// gocloud's blob.Reader.WriteTo, which allocates a fresh 1 MiB buffer per call on
+// the H2C path where the ResponseWriter is not an io.ReaderFrom.
+var copyBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, copyBufSize)
+		return &b
+	},
+}
+
+// readerOnly hides any io.WriterTo a reader implements, so io.CopyBuffer uses the
+// buffer we pass instead of the reader's own WriteTo path.
+type readerOnly struct{ io.Reader }
 
 // defaultNotFoundBody is the gateway's built-in 404 page, served when a release
 // has no custom notFound document (e.g. docs today, §4.4).
@@ -42,14 +72,20 @@ const defaultNotFoundBody = `<!doctype html>
 type Config struct {
 	Store            blobstore.Store
 	ManifestCacheCap int
-	Logger           *slog.Logger
+	// ManifestCacheBytes bounds the manifest cache by approximate retained bytes
+	// in addition to entry count. Zero (the default) means no byte bound; the
+	// binary wires this from MANIFEST_CACHE_BYTES so memory can be tuned per
+	// deployment without a code change.
+	ManifestCacheBytes int64
+	Logger             *slog.Logger
 }
 
 // Handler is the static-gateway http.Handler.
 type Handler struct {
-	store  blobstore.Store
-	cache  *manifestCache
-	logger *slog.Logger
+	store   blobstore.Store
+	cache   *manifestCache
+	mfGroup singleflight.Group // collapses concurrent first-loads of one manifest
+	logger  *slog.Logger
 }
 
 // New builds a Handler from cfg. Store is required.
@@ -67,7 +103,7 @@ func New(cfg Config) (*Handler, error) {
 	}
 	return &Handler{
 		store:  cfg.Store,
-		cache:  newManifestCache(cap),
+		cache:  newManifestCache(cap, cfg.ManifestCacheBytes),
 		logger: logger,
 	}, nil
 }
@@ -130,26 +166,49 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // loadManifest returns the parsed manifest for s, caching it by storage key.
+//
+// A freshly-published release is cold at every edge POP at once, so its first
+// requests fan in to this origin on one uncached manifest key during the brief
+// window before the LRU is populated. singleflight collapses that burst into a
+// single GCS read + parse per replica. The release-sha is immutable, so every
+// waiter that receives the leader's result gets the one true manifest for the key
+// — coalescing can never serve stale content.
 func (h *Handler) loadManifest(ctx context.Context, s site) (*manifest.Manifest, error) {
 	key := blobstore.ManifestKey(s.project, s.name, s.releaseSHA)
 	if m, ok := h.cache.get(key); ok {
 		return m, nil
 	}
-	rc, err := h.store.Get(ctx, key)
+	v, err, _ := h.mfGroup.Do(key, func() (any, error) {
+		// A concurrent leader may have populated the cache between our miss above
+		// and acquiring this call slot.
+		if m, ok := h.cache.get(key); ok {
+			return m, nil
+		}
+		// Detach from the triggering request's context so one caller disconnecting
+		// does not cancel the shared load and fail every waiter behind it; bound it
+		// with a dedicated timeout instead.
+		loadCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), manifestLoadTimeout)
+		defer cancel()
+		rc, err := h.store.Get(loadCtx, key)
+		if err != nil {
+			return nil, err
+		}
+		defer rc.Close()
+		data, err := io.ReadAll(rc)
+		if err != nil {
+			return nil, err
+		}
+		m, err := manifest.Load(data)
+		if err != nil {
+			return nil, err
+		}
+		h.cache.add(key, m)
+		return m, nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	defer rc.Close()
-	data, err := io.ReadAll(rc)
-	if err != nil {
-		return nil, err
-	}
-	m, err := manifest.Load(data)
-	if err != nil {
-		return nil, err
-	}
-	h.cache.add(key, m)
-	return m, nil
+	return v.(*manifest.Manifest), nil
 }
 
 // serveBlob streams the blob backing entry with status, stamping Content-Type,
@@ -169,14 +228,12 @@ func (h *Handler) serveBlob(w http.ResponseWriter, r *http.Request, s site, m *m
 	isHTML := strings.HasPrefix(entry.ContentType, "text/html")
 	h.setSecurityHeaders(hdr, m, isHTML)
 
-	// Last-Modified from the manifest createdAt (a release is immutable, so all of
-	// its blobs share the release's creation time as a sane validator, §4.6).
-	var modTime time.Time
-	if m.CreatedAt != "" {
-		if t, err := time.Parse(time.RFC3339, m.CreatedAt); err == nil {
-			modTime = t
-			hdr.Set("Last-Modified", t.UTC().Format(http.TimeFormat))
-		}
+	// Last-Modified from the manifest createdAt, parsed and formatted once at load
+	// (a release is immutable, so all of its blobs share the release's creation
+	// time as a sane validator, §4.6).
+	modTime := m.ModTime()
+	if lm := m.LastModified(); lm != "" {
+		hdr.Set("Last-Modified", lm)
 	}
 
 	// Conditional request: 304 when the validator matches. A successful 304 must
@@ -208,8 +265,24 @@ func (h *Handler) serveBlob(w http.ResponseWriter, r *http.Request, s site, m *m
 	}
 	defer rc.Close()
 
+	// Content-Length lets the edge and clients size the response and avoids chunked
+	// transfer encoding on the HTTP/1.1 hop. gocloud's reader exposes the size from
+	// already-fetched attributes, so this costs no extra round-trip; a Store whose
+	// reader doesn't expose Size() simply omits the header.
+	if sz, ok := rc.(interface{ Size() int64 }); ok {
+		if n := sz.Size(); n >= 0 {
+			hdr.Set("Content-Length", strconv.FormatInt(n, 10))
+		}
+	}
+
 	w.WriteHeader(status)
-	if _, err := io.Copy(w, rc); err != nil {
+
+	// Stream through a pooled buffer. readerOnly hides the reader's WriteTo so the
+	// copy uses our buffer instead of gocloud's per-call 1 MiB allocation.
+	buf := copyBufPool.Get().(*[]byte)
+	_, err = io.CopyBuffer(w, readerOnly{rc}, *buf)
+	copyBufPool.Put(buf)
+	if err != nil {
 		// Client disconnects are normal; log at debug to avoid noise.
 		h.logger.Debug("stream blob", "key", key, "error", err)
 	}
