@@ -5,15 +5,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"time"
 
 	"gocloud.dev/blob"
-	"gocloud.dev/gcerrors"
-
-	// gcsblob registers the gs:// scheme with gocloud's blob.OpenBucket. It
-	// authenticates with Application Default Credentials (Workload Identity in
-	// cluster, §6.5). Swapping this blank import for moonrhythm/r2blob's r2://
+	// gcsblob authenticates with Application Default Credentials (Workload Identity
+	// in cluster, §6.5). Swapping gcsblob.OpenBucket for moonrhythm/r2blob's r2://
 	// opener moves the gateway to Cloudflare R2 with no other code change (§4.2).
-	_ "gocloud.dev/blob/gcsblob"
+	"gocloud.dev/blob/gcsblob"
+	"gocloud.dev/gcerrors"
+	"gocloud.dev/gcp"
 )
 
 // gcsStore is a read-only Store backed by a gocloud blob bucket (gs:// today).
@@ -21,14 +22,33 @@ type gcsStore struct {
 	bucket *blob.Bucket
 }
 
-// OpenGCS opens the bucket named by bucketName (without scheme) over the gs://
-// gocloud provider and returns a read-only Store. Credentials come from ADC. The
-// returned closer releases the underlying bucket.
+// OpenGCS opens the bucket named by bucketName (without scheme) and returns a
+// read-only Store. Credentials come from ADC. The returned closer releases the
+// underlying bucket.
+//
+// It does NOT use blob.OpenBucket("gs://...") because that wires the GCS client
+// to http.DefaultTransport, which keeps only DefaultMaxIdleConnsPerHost (2) idle
+// connections. Every read targets one host (storage.googleapis.com), so under any
+// concurrency the gateway constantly opens fresh TLS connections — adding tens of
+// ms of handshake latency to a large fraction of reads. We build the client with
+// a transport whose connection pool is sized for a read-heavy origin instead.
 func OpenGCS(ctx context.Context, bucketName string) (Store, func() error, error) {
 	if bucketName == "" {
 		return nil, nil, errors.New("blobstore: empty bucket name")
 	}
-	bucket, err := blob.OpenBucket(ctx, "gs://"+bucketName)
+	creds, err := gcp.DefaultCredentials(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("blobstore: default credentials: %w", err)
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConns = 200
+	transport.MaxIdleConnsPerHost = 100
+	transport.IdleConnTimeout = 120 * time.Second
+	client, err := gcp.NewHTTPClient(transport, creds.TokenSource)
+	if err != nil {
+		return nil, nil, fmt.Errorf("blobstore: build http client: %w", err)
+	}
+	bucket, err := gcsblob.OpenBucket(ctx, client, bucketName, nil)
 	if err != nil {
 		return nil, nil, fmt.Errorf("blobstore: open bucket %q: %w", bucketName, err)
 	}
