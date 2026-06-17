@@ -63,7 +63,7 @@ func TestManifestCacheMinCap(t *testing.T) {
 func loadManifestN(t *testing.T, n int) *manifest.Manifest {
 	t.Helper()
 	files := make(map[string]any, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		files[fmt.Sprintf("p/%04d.html", i)] = map[string]any{
 			"blob": "deadbeef", "ct": "text/html; charset=utf-8", "cache": "html",
 		}
