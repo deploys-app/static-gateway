@@ -132,16 +132,16 @@ func TestCachingStoreConcurrent(t *testing.T) {
 	ctx := context.Background()
 	f := NewFake()
 	const n = 12
-	for i := 0; i < n; i++ {
+	for i := range n {
 		f.Put(blobKey(string(rune('a'+i))), []byte(strings.Repeat("y", 10)), "text/plain")
 	}
 	cs := NewCachingStore(f, 50, 1<<20) // budget holds ~5 blobs -> constant eviction
 
 	done := make(chan struct{})
-	for g := 0; g < 16; g++ {
+	for g := range 16 {
 		go func(g int) {
 			defer func() { done <- struct{}{} }()
-			for i := 0; i < 200; i++ {
+			for i := range 200 {
 				key := blobKey(string(rune('a' + (g+i)%n)))
 				rc, err := cs.Get(ctx, key)
 				if err != nil {
@@ -155,7 +155,7 @@ func TestCachingStoreConcurrent(t *testing.T) {
 			}
 		}(g)
 	}
-	for g := 0; g < 16; g++ {
+	for range 16 {
 		<-done
 	}
 	if b := cs.(*CachingStore).cache.bytes; b > 50 {

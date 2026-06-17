@@ -309,7 +309,7 @@ func TestLoadManifestSingleflight(t *testing.T) {
 
 	var wg sync.WaitGroup
 	codes := make([]int, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()

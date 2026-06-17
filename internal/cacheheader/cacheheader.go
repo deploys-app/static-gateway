@@ -66,7 +66,7 @@ func NotModified(ifNoneMatch, etag string) bool {
 		return true
 	}
 	target := normalizeETag(etag)
-	for _, candidate := range strings.Split(ifNoneMatch, ",") {
+	for candidate := range strings.SplitSeq(ifNoneMatch, ",") {
 		if normalizeETag(candidate) == target {
 			return true
 		}
