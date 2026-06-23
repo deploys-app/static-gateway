@@ -86,6 +86,8 @@ the requested release already references.
 | `METRICS_PORT` | no | `9090` | Prometheus scrape port (`/metrics`) |
 | `MANIFEST_CACHE_BYTES` | no | `268435456` (256 MiB) | approximate-bytes budget for the parsed-manifest cache; `0` = entry-count bound only |
 | `BLOB_CACHE_BYTES` | no | `134217728` (128 MiB) | in-process cache budget for small immutable blobs (≤1 MiB each) served from memory instead of a GCS read; `0` disables |
+| `METRICS_TTL` | no | `48h` | idle window after which a site's per-site metric label sets are evicted to bound cardinality as previews churn; must exceed the collector's 1-day billing window; `0` disables eviction |
+| `METRICS_SWEEP_INTERVAL` | no | `1h` | how often the evictor sweeps for idle sites |
 
 The two caches stack in memory — `BLOB_CACHE_BYTES` fills with real file bytes, so
 size the sum against the container memory limit before raising it. Larger blobs

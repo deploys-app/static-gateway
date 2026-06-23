@@ -133,8 +133,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Count every request to a resolved site (the collector sums this per
-	// project+name to attribute request volume to the Static deployment).
-	metrics.Requests.WithLabelValues(s.project, s.name).Inc()
+	// project+name to attribute request volume to the Static deployment) and
+	// mark the site active for the metric-cardinality evictor.
+	metrics.ObserveRequest(s.project, s.name)
 
 	m, err := h.loadManifest(r.Context(), s)
 	if err != nil {
@@ -280,8 +281,11 @@ func (h *Handler) serveBlob(w http.ResponseWriter, r *http.Request, s site, m *m
 	// Stream through a pooled buffer. readerOnly hides the reader's WriteTo so the
 	// copy uses our buffer instead of gocloud's per-call 1 MiB allocation.
 	buf := copyBufPool.Get().(*[]byte)
-	_, err = io.CopyBuffer(w, readerOnly{rc}, *buf)
+	n, err := io.CopyBuffer(w, readerOnly{rc}, *buf)
 	copyBufPool.Put(buf)
+	// Count the bytes actually streamed (origin-side egress for this site), even
+	// on a partial write before a client disconnect.
+	metrics.AddResponseBytes(s.project, s.name, n)
 	if err != nil {
 		// Client disconnects are normal; log at debug to avoid noise.
 		h.logger.Debug("stream blob", "key", key, "error", err)
@@ -305,7 +309,8 @@ func (h *Handler) serveNotFound(w http.ResponseWriter, r *http.Request, s site, 
 	if r.Method == http.MethodHead {
 		return
 	}
-	_, _ = io.WriteString(w, defaultNotFoundBody)
+	n, _ := io.WriteString(w, defaultNotFoundBody)
+	metrics.AddResponseBytes(s.project, s.name, int64(n))
 }
 
 // setSecurityHeaders reproduces the website's _headers intent that a non-Cloudflare
