@@ -372,6 +372,95 @@ func TestServeDefault404(t *testing.T) {
 	}
 }
 
+// TestServeCountsResponseBytes verifies the per-site egress counter increases by
+// exactly the streamed body length on a hit and a custom 404 (both via
+// serveBlob), and stays flat on HEAD and a 304 (no body streamed).
+func TestServeCountsResponseBytes(t *testing.T) {
+	m, blobs := hugoManifest("production")
+	h := fixture(t, m, blobs)
+	metrics.ResponseBytes.DeleteLabelValues(testProject, testName)
+
+	read := func() float64 {
+		return testutil.ToFloat64(metrics.ResponseBytes.WithLabelValues(testProject, testName))
+	}
+
+	// Hit: counted by exactly the streamed body length.
+	w := do(h, http.MethodGet, prefix("/getting-started/introduction/"), nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("hit code = %d", w.Code)
+	}
+	want := float64(w.Body.Len())
+	if got := read(); got != want {
+		t.Fatalf("after hit ResponseBytes = %v, want %v", got, want)
+	}
+
+	// HEAD: no body, counter unchanged.
+	if wh := do(h, http.MethodHead, prefix("/"), nil); wh.Body.Len() != 0 {
+		t.Fatalf("HEAD carried a body")
+	}
+	if got := read(); got != want {
+		t.Fatalf("after HEAD ResponseBytes = %v, want unchanged %v", got, want)
+	}
+
+	// A GET sizes the validator, then a conditional request 304s with no body.
+	hit := do(h, http.MethodGet, prefix("/style/main.4f3a9b.css"), nil)
+	want += float64(hit.Body.Len())
+	w304 := do(h, http.MethodGet, prefix("/style/main.4f3a9b.css"), map[string]string{"If-None-Match": hit.Header().Get("ETag")})
+	if w304.Code != http.StatusNotModified || w304.Body.Len() != 0 {
+		t.Fatalf("conditional: code=%d bodyLen=%d", w304.Code, w304.Body.Len())
+	}
+	if got := read(); got != want {
+		t.Fatalf("after 304 ResponseBytes = %v, want unchanged %v", got, want)
+	}
+
+	// Custom 404 document is streamed through serveBlob and counted.
+	w404 := do(h, http.MethodGet, prefix("/does-not-exist/"), nil)
+	if w404.Code != http.StatusNotFound {
+		t.Fatalf("custom 404 code = %d", w404.Code)
+	}
+	want += float64(w404.Body.Len())
+	if got := read(); got != want {
+		t.Fatalf("after custom 404 ResponseBytes = %v, want %v", got, want)
+	}
+}
+
+// TestServeCountsSPAAndDefaultNotFoundBytes covers the other two body-writing
+// paths: an SPA fallback (serveBlob) and the built-in default 404 (serveNotFound).
+func TestServeCountsSPAAndDefaultNotFoundBytes(t *testing.T) {
+	spa := &manifest.Manifest{
+		Release: testRelease, Environment: "production", SPA: true,
+		Files: map[string]manifest.File{
+			"index.html": {Blob: "b_index", ContentType: "text/html; charset=utf-8", Cache: "html"},
+		},
+	}
+	h := fixture(t, spa, map[string]string{"b_index": "<html>spa</html>"})
+	metrics.ResponseBytes.DeleteLabelValues(testProject, testName)
+	w := do(h, http.MethodGet, prefix("/client/route"), nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("spa code = %d", w.Code)
+	}
+	if got := testutil.ToFloat64(metrics.ResponseBytes.WithLabelValues(testProject, testName)); got != float64(w.Body.Len()) {
+		t.Fatalf("spa ResponseBytes = %v, want %v", got, w.Body.Len())
+	}
+
+	// Built-in default 404 (release has no 404 doc) is written by serveNotFound.
+	bare := &manifest.Manifest{
+		Release: testRelease, Environment: "production",
+		Files: map[string]manifest.File{
+			"index.html": {Blob: "b_index", ContentType: "text/html; charset=utf-8", Cache: "html"},
+		},
+	}
+	h2 := fixture(t, bare, map[string]string{"b_index": "<html>home</html>"})
+	metrics.ResponseBytes.DeleteLabelValues(testProject, testName)
+	w = do(h2, http.MethodGet, prefix("/missing/"), nil)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("default 404 code = %d", w.Code)
+	}
+	if got := testutil.ToFloat64(metrics.ResponseBytes.WithLabelValues(testProject, testName)); got != float64(w.Body.Len()) {
+		t.Fatalf("default 404 ResponseBytes = %v, want %v", got, w.Body.Len())
+	}
+}
+
 func TestServeNoindexOnPreview(t *testing.T) {
 	m, blobs := hugoManifest("pr-7")
 	h := fixture(t, m, blobs)

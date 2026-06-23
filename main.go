@@ -19,6 +19,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/deploys-app/static-gateway/internal/blobstore"
+	"github.com/deploys-app/static-gateway/internal/metrics"
 	"github.com/deploys-app/static-gateway/internal/server"
 )
 
@@ -88,6 +89,13 @@ func main() {
 		}
 	}()
 
+	// Evict the per-site metric label sets of sites gone idle, so ephemeral /
+	// TTL'd preview names don't accumulate in the counters for this replica's
+	// lifetime. METRICS_TTL must exceed the collector's 1-day billing window so a
+	// site is never swept before its same-day egress is read; METRICS_TTL=0
+	// disables eviction.
+	metrics.StartEvictor(ctx, getenvDuration("METRICS_TTL", 48*time.Hour), getenvDuration("METRICS_SWEEP_INTERVAL", time.Hour))
+
 	// parapet.NewBackend(): H2C-enabled, trusts X-Forwarded-* (it sits behind the
 	// in-cluster parapet core), matching the dropbox/ipfs-gateway pattern.
 	srv := parapet.NewBackend()
@@ -134,4 +142,20 @@ func getenvInt64(key string, def int64) int64 {
 		return def
 	}
 	return n
+}
+
+// getenvDuration parses a Go duration env (e.g. "48h", "30m"), falling back to
+// def on empty or invalid input. A valid "0" returns 0, which disables the
+// metric evictor.
+func getenvDuration(key string, def time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		slog.Warn("invalid duration env, using default", "key", key, "value", v, "default", def)
+		return def
+	}
+	return d
 }
