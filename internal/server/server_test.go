@@ -310,12 +310,10 @@ func TestLoadManifestSingleflight(t *testing.T) {
 	var wg sync.WaitGroup
 	codes := make([]int, n)
 	for i := range n {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
+		wg.Go(func() {
 			w := do(h, http.MethodGet, prefix("/"), nil)
 			codes[i] = w.Code
-		}(i)
+		})
 	}
 
 	// Wait until at least one manifest Get is in-flight, then release everyone.
