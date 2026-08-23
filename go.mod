@@ -1,6 +1,6 @@
 module github.com/deploys-app/static-gateway
 
-go 1.26.4
+go 1.27.0
 
 require (
 	github.com/moonrhythm/parapet v0.18.3
