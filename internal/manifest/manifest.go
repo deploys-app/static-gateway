@@ -10,10 +10,9 @@
 package manifest
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"sort"
@@ -137,9 +136,7 @@ func (m *Manifest) precompute() {
 // gateway needs to serve from it.
 func Load(data []byte) (*Manifest, error) {
 	var m Manifest
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&m); err != nil {
+	if err := json.Unmarshal(data, &m, json.RejectUnknownMembers(true)); err != nil {
 		return nil, fmt.Errorf("manifest: decode: %w", err)
 	}
 	if m.Files == nil {
@@ -200,12 +197,11 @@ func canonicalizeFileKeys(files map[string]File) map[string]File {
 // sha256 is the release-sha (§5.3). The gateway uses it to verify a loaded
 // manifest's release-sha when desired; the publish side uses it to mint the sha.
 func (m *Manifest) Canonical() ([]byte, error) {
-	// Build an ordered representation. encoding/json already emits struct fields
-	// in declaration order and sorts map keys, but we additionally normalize by
-	// constructing the files map ourselves with sorted keys via json.Marshal of a
-	// map (which sorts keys) — so the only nondeterminism to guard is float/int
-	// formatting, which we do not use. We also zero the Release field so the
-	// canonical form is independent of any release value carried in the body.
+	// Build an ordered representation. encoding/json/v2 emits struct fields in
+	// declaration order; json.Deterministic sorts map keys so the files object
+	// is stable regardless of Go map iteration. We also zero the Release field
+	// so the canonical form is independent of any release value carried in the
+	// body.
 	c := canonicalManifest{
 		CreatedAt:   m.CreatedAt,
 		Environment: m.Environment,
@@ -213,7 +209,7 @@ func (m *Manifest) Canonical() ([]byte, error) {
 		NotFound:    m.NotFound,
 		Files:       m.Files,
 	}
-	return json.Marshal(c)
+	return json.Marshal(c, json.Deterministic(true))
 }
 
 // canonicalManifest is the field set and order used to mint the release-sha.
